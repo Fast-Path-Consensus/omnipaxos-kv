@@ -128,6 +128,8 @@ impl OmniPaxosServer {
                 },
                 _ = clock_sync_interval.tick() => {
                     self.omnipaxos.sync_clock();
+                    // Re-arm early buffer timer since simulated time may have shifted
+                    self.reset_early_buffer_timer();
                 },
                 _ = owd_probe_interval.tick(), if !owd_complete => {
                     self.send_owd_probes();
