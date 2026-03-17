@@ -730,12 +730,19 @@ impl OmniPaxosServer {
         epoch: Ballot,
     ) {
         // Apply the log modification - find entry in late/early buffer, update deadline, append to log
-        let _follower_hash = self.omnipaxos.apply_log_modification(
+        let follower_hash = self.omnipaxos.apply_log_modification(
             client_id,
             command_id,
             deadline,
             log_id,
         );
+
+        // Only send slow reply if log modification succeeded (per paper: follower must have
+        // successfully processed the log-modification before sending slow-reply)
+        if follower_hash.is_none() {
+            // Entry not found or log divergence - don't send slow reply
+            return;
+        }
 
         // Send slow reply (per paper: slow-reply doesn't include hash, just acknowledgment)
         // Look up coordinator_id from quorum_records if we're the proxy
