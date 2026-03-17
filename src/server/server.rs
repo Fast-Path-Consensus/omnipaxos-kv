@@ -315,7 +315,7 @@ impl OmniPaxosServer {
             };
             self.omnipaxos.append_synced_log(cmd_for_synced_log, result.clone());
 
-            // Broadcast LogModification to all followers
+            // Broadcast LogModification to all followers (includes full entry for repair)
             for peer in &self.peers {
                 self.network.send_to_cluster(
                     *peer,
@@ -326,6 +326,7 @@ impl OmniPaxosServer {
                         log_id,
                         hash: hash.clone(),
                         epoch,
+                        entry: cmd.entry.clone(),
                     },
                 );
             }
@@ -540,8 +541,9 @@ impl OmniPaxosServer {
                     log_id,
                     hash: leader_hash,
                     epoch,
+                    entry,
                 } => {
-                    self.handle_log_modification(from, client_id, command_id, deadline, log_id, leader_hash, epoch);
+                    self.handle_log_modification(from, client_id, command_id, deadline, log_id, leader_hash, epoch, entry);
                 },
                 ClusterMessage::FollowerSlowReply {
                     from,
@@ -728,13 +730,15 @@ impl OmniPaxosServer {
         log_id: usize,
         _leader_hash: FastHash,
         epoch: Ballot,
+        entry: Command,
     ) {
-        // Apply the log modification - find entry in late/early buffer, update deadline, append to log
+        // Apply the log modification - find entry in late/early buffer, or use provided entry
         let follower_hash = self.omnipaxos.apply_log_modification(
             client_id,
             command_id,
             deadline,
             log_id,
+            entry,
         );
 
         // Only send slow reply if log modification succeeded (per paper: follower must have

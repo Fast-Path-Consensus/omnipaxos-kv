@@ -52,6 +52,7 @@ pub mod messages {
             epoch: Ballot,
         },
         /// Slow path: Leader broadcasts log modification to sync followers
+        /// Includes full entry so follower can apply even if it missed the original broadcast
         LogModification {
             client_id: ClientId,
             command_id: CommandId,
@@ -59,6 +60,7 @@ pub mod messages {
             log_id: usize,
             hash: FastHash,
             epoch: Ballot,
+            entry: Command,
         },
     }
 
