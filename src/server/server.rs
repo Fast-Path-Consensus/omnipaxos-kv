@@ -758,6 +758,7 @@ impl OmniPaxosServer {
             if total_matching < fast_quorum {
                 return;
             }
+            // start of slow path
 
             // Evaluate the leader's execution result as the response at row 698
             Self::response_from_exec_result(command_id, leader_reply)
