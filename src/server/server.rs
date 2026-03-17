@@ -8,7 +8,7 @@ use std::pin::Pin;
 use tokio::time::{sleep, Instant, Sleep};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::Write,
     time::Duration,
@@ -42,6 +42,8 @@ struct QuorumRecord {
     epoch: Option<Ballot>,
     leader_reply: Option<LeaderReplyRecord>,
     follower_hashes: HashMap<NodeId, FastHash>,
+    /// Nodes that sent slow replies (can count as fast replies per paper)
+    slow_reply_nodes: HashSet<NodeId>,
     proxy_has_completed: bool,
 }
 
@@ -149,6 +151,10 @@ impl OmniPaxosServer {
                 _ = &mut self.early_buffer_sleep, if self.early_buffer_timer_armed => {
                 let released_buffer = self.omnipaxos.process_early_buffer();
                 self.handle_released_entries(released_buffer);
+                
+                // Leader processes late buffer for slow path
+                self.process_late_buffer_if_leader();
+                
                 self.reset_early_buffer_timer();
                 self.send_outgoing_msgs();
                 },
@@ -275,6 +281,74 @@ impl OmniPaxosServer {
         }
     }
 
+    /// Leader processes late buffer entries for slow path.
+    /// Re-sequences entries, executes, broadcasts LogModification, sends replies.
+    fn process_late_buffer_if_leader(&mut self) {
+        // Only leader in accept phase processes late buffer
+        let Some((leader_id, is_accept_phase)) = self.omnipaxos.get_current_leader() else {
+            return;
+        };
+        if leader_id != self.id || !is_accept_phase {
+            return;
+        }
+
+        let epoch = self.omnipaxos.get_promise();
+        let late_entries = self.omnipaxos.process_late_buffer();
+
+        for cmd in late_entries {
+            let result = self.execute_on_state_machine(&cmd.entry);
+            // Track execution for decide path
+            self.fast_path_executed.insert((cmd.entry.client_id, cmd.entry.id), result.clone());
+
+            let coordinator_id = cmd.entry.coordinator_id;
+            let command_id = cmd.entry.id;
+            let client_id = cmd.entry.client_id;
+            let deadline = cmd.entry.deadline;
+            let log_id = cmd.log_id;
+            let hash = cmd.hash.clone().expect("Late entry should have hash");
+
+            // Append to synced_log for slow path recovery
+            let cmd_for_synced_log = omnipaxos::ReleasedEntry {
+                entry: cmd.entry.clone(),
+                log_id: cmd.log_id,
+                hash: cmd.hash.clone(),
+            };
+            self.omnipaxos.append_synced_log(cmd_for_synced_log, result.clone());
+
+            // Broadcast LogModification to all followers
+            for peer in &self.peers {
+                self.network.send_to_cluster(
+                    *peer,
+                    ClusterMessage::LogModification {
+                        client_id,
+                        command_id,
+                        deadline,
+                        log_id,
+                        hash: hash.clone(),
+                        epoch,
+                    },
+                );
+            }
+
+            // Send leader reply to proxy
+            if coordinator_id == self.id {
+                self.handle_local_leader_execution_reply(cmd, epoch, result, hash);
+            } else {
+                self.network.send_to_cluster(
+                    coordinator_id,
+                    ClusterMessage::LeaderFastReply {
+                        from: self.id,
+                        command_id,
+                        client_id,
+                        epoch,
+                        result,
+                        hash,
+                    },
+                );
+            }
+        }
+    }
+
     fn reset_early_buffer_timer(&mut self) {
         match self.omnipaxos.time_until_next_early_buffer_deadline() {
             Some(wait_us) => {
@@ -388,6 +462,7 @@ impl OmniPaxosServer {
                             epoch: None,
                             leader_reply: None,
                             follower_hashes: HashMap::new(),
+                            slow_reply_nodes: HashSet::new(),
                             proxy_has_completed: false,
                         },
                     );
@@ -458,9 +533,24 @@ impl OmniPaxosServer {
                 } => {
                     self.handle_leader_fast_reply(from, command_id, client_id, epoch, result, hash);
                 },
-                /* ClusterMessage::LogModification {
-                    // self.omnipaxos.syncModified(cmd);
-                } */
+                ClusterMessage::LogModification {
+                    client_id,
+                    command_id,
+                    deadline,
+                    log_id,
+                    hash: leader_hash,
+                    epoch,
+                } => {
+                    self.handle_log_modification(from, client_id, command_id, deadline, log_id, leader_hash, epoch);
+                },
+                ClusterMessage::FollowerSlowReply {
+                    from,
+                    command_id,
+                    client_id,
+                    epoch,
+                } => {
+                    self.handle_follower_slow_reply(from, command_id, client_id, epoch);
+                },
             }
         }
         self.send_outgoing_msgs();
@@ -627,8 +717,48 @@ impl OmniPaxosServer {
         self.database.handle_command(command.kv_cmd.clone())
     }
 
-    fn broadcast_log_modification(&self) {
-        todo!()
+    /// Follower handles LogModification from leader (slow path).
+    /// Syncs log with leader and sends slow reply to proxy.
+    fn handle_log_modification(
+        &mut self,
+        _from: NodeId,
+        client_id: ClientId,
+        command_id: CommandId,
+        deadline: i64,
+        log_id: usize,
+        _leader_hash: FastHash,
+        epoch: Ballot,
+    ) {
+        // Apply the log modification - find entry in late/early buffer, update deadline, append to log
+        let _follower_hash = self.omnipaxos.apply_log_modification(
+            client_id,
+            command_id,
+            deadline,
+            log_id,
+        );
+
+        // Send slow reply (per paper: slow-reply doesn't include hash, just acknowledgment)
+        // Look up coordinator_id from quorum_records if we're the proxy
+        let key = (client_id, command_id);
+        if let Some(record) = self.quorum_records.get(&key) {
+            // We're the proxy - handle locally
+            if !record.proxy_has_completed {
+                self.handle_follower_slow_reply(self.id, command_id, client_id, epoch);
+            }
+        } else {
+            // We're not the proxy - broadcast to all peers (proxy will filter)
+            for peer in &self.peers {
+                self.network.send_to_cluster(
+                    *peer,
+                    ClusterMessage::FollowerSlowReply {
+                        from: self.id,
+                        command_id,
+                        client_id,
+                        epoch,
+                    },
+                );
+            }
+        }
     }
 
     fn handle_leader_fast_reply(
@@ -668,7 +798,7 @@ impl OmniPaxosServer {
             hash,
         });
 
-        self.try_complete_fast_path(client_id, command_id);
+        self.try_complete_quorum(client_id, command_id);
 
     }
 
@@ -685,6 +815,7 @@ impl OmniPaxosServer {
                 record.epoch = Some(epoch);
                 record.leader_reply = None;
                 record.follower_hashes.clear();
+                record.slow_reply_nodes.clear();
             }
             Some(_) => {}
         }
@@ -721,10 +852,43 @@ impl OmniPaxosServer {
         record.follower_hashes.insert(node_id, hash);
 
         // Try checking for fast-path quorum
-        self.try_complete_fast_path(client_id, command_id);
+        self.try_complete_quorum(client_id, command_id);
     }
 
-    fn try_complete_fast_path(&mut self, client_id: ClientId, command_id: CommandId) {
+    /// Handle slow reply from follower (after LogModification)
+    fn handle_follower_slow_reply(
+        &mut self,
+        node_id: NodeId,
+        command_id: CommandId,
+        client_id: ClientId,
+        epoch: Ballot,
+    ) {
+        let key = (client_id, command_id);
+
+        let Some(record) = self.quorum_records.get_mut(&key) else {
+            return;
+        };
+
+        if record.proxy_has_completed {
+            return;
+        }
+
+        if Self::check_if_stale_epoch(epoch, record) { return; }
+
+        // Duplicate slow reply from same node
+        if record.slow_reply_nodes.contains(&node_id) {
+            return;
+        }
+
+        // Store slow reply
+        record.slow_reply_nodes.insert(node_id);
+
+        // Try to complete (slow reply can enable both fast and slow path completion)
+        self.try_complete_quorum(client_id, command_id);
+    }
+
+    /// Try to complete request via fast path or slow path per Algorithm 2
+    fn try_complete_quorum(&mut self, client_id: ClientId, command_id: CommandId) {
         let key = (client_id, command_id);
 
         let response = {
@@ -736,32 +900,47 @@ impl OmniPaxosServer {
                 return;
             }
 
+            // Line 17-18: Leader's fast-reply must be included
             let Some(leader_reply) = &record.leader_reply else {
                 return;
             };
 
-            // Count amount of matching hashes from leader with followers.
-            let matching_follower_count = record
-                .follower_hashes
-                .values()
-                .filter(|hash| **hash == leader_reply.hash)
-                .count();
-
-            // Nezha fast quorum for n = 2f + 1 replicas:
-            // fast_quorum = f + ceil(f / 2) + 1
             let n = self.peers.len() + 1; // peers + self
             let f = (n - 1) / 2;
-            let fast_quorum = f + f.div_ceil(2) + 1;
 
-            let total_matching = 1 + matching_follower_count;  // include leader's hash
+            // Algorithm 2, lines 19-25: Count fast and slow replies
+            let mut fast_reply_num = 1; // Leader's fast-reply counts
+            let mut slow_reply_num = 0;
 
-            if total_matching < fast_quorum {
-                return;
+            for &peer_id in &self.peers {
+                if record.slow_reply_nodes.contains(&peer_id) {
+                    // Line 21-23: slow-reply can serve as fast-reply, but not the opposite
+                    slow_reply_num += 1;
+                    fast_reply_num += 1;
+                } else if let Some(hash) = record.follower_hashes.get(&peer_id) {
+                    // Line 24-25: fast-reply only counts if hash matches leader's
+                    if *hash == leader_reply.hash {
+                        fast_reply_num += 1;
+                    }
+                }
             }
-            // start of slow path
 
-            // Evaluate the leader's execution result as the response at row 698
-            Self::response_from_exec_result(command_id, leader_reply)
+            // Line 26-27: Check fast path quorum (1 + f + ⌈f/2⌉)
+            let fast_quorum = 1 + f + f.div_ceil(2);
+            if fast_reply_num >= fast_quorum {
+                Some(Self::response_from_exec_result(command_id, leader_reply))
+            }
+            // Line 28-29: Check slow path quorum (leader's fast-reply + f slow-replies)
+            else if slow_reply_num >= f {
+                Some(Self::response_from_exec_result(command_id, leader_reply))
+            } else {
+                // Neither quorum met
+                None
+            }
+        };
+
+        let Some(response) = response else {
+            return;
         };
 
         let Some(record) = self.quorum_records.get_mut(&key) else {

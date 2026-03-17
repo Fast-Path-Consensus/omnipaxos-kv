@@ -43,6 +43,23 @@ pub mod messages {
             epoch: Ballot,
             hash: FastHash
         },
+        /// Slow path: Follower reply after processing LogModification
+        /// Per paper: slow-reply can count as fast-reply, but not the opposite
+        FollowerSlowReply {
+            from: NodeId,
+            command_id: CommandId,
+            client_id: ClientId,
+            epoch: Ballot,
+        },
+        /// Slow path: Leader broadcasts log modification to sync followers
+        LogModification {
+            client_id: ClientId,
+            command_id: CommandId,
+            deadline: i64,
+            log_id: usize,
+            hash: FastHash,
+            epoch: Ballot,
+        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
