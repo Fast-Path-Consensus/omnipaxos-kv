@@ -231,10 +231,25 @@ impl OmniPaxosServer {
                     // Use the progressive hash stored during release (matching follower per-entry hashes)
                     let hash = cmd.hash.clone().expect("Leader should have progressive hash per entry");
 
+                    let deadline = cmd.entry.deadline;
+                    let log_id = cmd.log_id;
 
-                    // Broadcast log modification?
-                    //self.append_log_modification_entry(ersu)
-                    //self.broadcast_log_modification();
+                    // Per Algorithm 1 line 19: Leader broadcasts LogModification for EVERY released entry
+                    // This allows followers with late-arriving requests (in their late-buffer) to sync
+                    for peer in &self.peers {
+                        self.network.send_to_cluster(
+                            *peer,
+                            ClusterMessage::LogModification {
+                                client_id,
+                                command_id,
+                                deadline,
+                                log_id,
+                                hash: hash.clone(),
+                                epoch,
+                                entry: cmd.entry.clone(),
+                            },
+                        );
+                    }
 
                     if coordinator_id == self.id { // If I am proxy for this message.
                         self.handle_local_leader_execution_reply(cmd, epoch, result, hash);
