@@ -10,6 +10,11 @@ impl Database {
         Self { db: HashMap::new() }
     }
 
+    /// Read-only lookup (for fast-path re-reads without re-executing writes)
+    pub fn get(&self, key: &str) -> Option<Option<String>> {
+        Some(self.db.get(key).cloned())
+    }
+
     pub fn handle_command(&mut self, command: KVCommand) -> Option<Option<String>> {
         match command {
             KVCommand::Put(key, value) => {

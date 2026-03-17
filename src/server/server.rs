@@ -8,7 +8,7 @@ use std::pin::Pin;
 use tokio::time::{sleep, Instant, Sleep};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::Write,
     time::Duration,
@@ -62,6 +62,8 @@ pub struct OmniPaxosServer {
     // Sender-owned latest estimate returned by each peer's receiver
     deadline_send_array: HashMap<NodeId, i64>,
     quorum_records: HashMap<(ClientId, CommandId), QuorumRecord>,
+    /// Commands already executed via fast path (leader only) - skip in decide path
+    fast_path_executed: HashSet<(ClientId, CommandId)>,
 }
 
 impl OmniPaxosServer {
@@ -103,6 +105,7 @@ impl OmniPaxosServer {
             early_buffer_sleep: Box::pin(sleep(Duration::from_secs(24 * 60 * 60 * 365))),
             early_buffer_timer_armed: false,
             quorum_records: Default::default(),
+            fast_path_executed: HashSet::new(),
         }
     }
 
@@ -200,6 +203,8 @@ impl OmniPaxosServer {
             Some(epoch) => {
                 for cmd in released_entries {
                     let result = self.execute_on_state_machine(&cmd.entry);
+                    // Track that this command was executed via fast path to avoid double execution
+                    self.fast_path_executed.insert((cmd.entry.client_id, cmd.entry.id));
 
                     let coordinator_id = cmd.entry.coordinator_id;
                     let command_id = cmd.entry.id;
@@ -302,7 +307,17 @@ impl OmniPaxosServer {
 
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         for command in commands {
-            let read = self.database.handle_command(command.kv_cmd);
+            let key = (command.client_id, command.id);
+            // Skip execution if already executed via fast path (leader only)
+            let read = if self.fast_path_executed.remove(&key) {
+                // Already executed - just get the result for read responses if needed
+                match &command.kv_cmd {
+                    KVCommand::Get(k) => self.database.get(k),
+                    _ => None, // Writes don't need result
+                }
+            } else {
+                self.database.handle_command(command.kv_cmd.clone())
+            };
             if command.coordinator_id == self.id {
                 let response = match read {
                     Some(read_result) => ServerMessage::Read(command.id, read_result),
