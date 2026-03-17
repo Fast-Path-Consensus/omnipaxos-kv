@@ -210,14 +210,16 @@ impl OmniPaxosServer {
                     let command_id = cmd.entry.id;
                     let client_id = cmd.entry.client_id;
 
-                    // synced-log.append({𝑟𝑒𝑞𝑢𝑒𝑠𝑡,𝑟𝑒𝑠𝑢𝑙𝑡})
+                    // synced-log.append({𝑟𝑒𝑞𝑢𝑒𝑠𝑡,𝑟𝑒𝑠𝑢𝑙𝑡}) - for slow path recovery
                     let cmd_for_synced_log = omnipaxos::ReleasedEntry {
                         entry: cmd.entry.clone(),
                         log_id: cmd.log_id,
                         hash: cmd.hash.clone(),
                     };
                     self.omnipaxos.append_synced_log(cmd_for_synced_log, result.clone());
-                    let hash = self.omnipaxos.hash_synced_log();
+                    
+                    // Use the progressive hash stored during release (matching follower per-entry hashes)
+                    let hash = cmd.hash.clone().expect("Leader should have progressive hash per entry");
 
 
                     // Broadcast log modification?
