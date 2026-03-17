@@ -748,7 +748,7 @@ impl OmniPaxosServer {
                 .count();
 
             // Nezha fast quorum for n = 2f + 1 replicas:
-            // fast_quorum = f + floor(f / 2) + 1
+            // fast_quorum = f + ceil(f / 2) + 1
             let n = self.peers.len() + 1; // peers + self
             let f = (n - 1) / 2;
             let fast_quorum = f + f.div_ceil(2) + 1;
