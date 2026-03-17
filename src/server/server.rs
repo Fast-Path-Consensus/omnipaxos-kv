@@ -319,11 +319,23 @@ impl OmniPaxosServer {
                 self.database.handle_command(command.kv_cmd.clone())
             };
             if command.coordinator_id == self.id {
+                // Check if already replied via fast path to avoid duplicate response
+                let already_replied = self.quorum_records
+                    .get(&key)
+                    .map(|r| r.proxy_has_completed)
+                    .unwrap_or(false);
+                if already_replied {
+                    // Clean up the quorum record now that it's decided
+                    self.quorum_records.remove(&key);
+                    continue;
+                }
                 let response = match read {
                     Some(read_result) => ServerMessage::Read(command.id, read_result),
                     None => ServerMessage::Write(command.id),
                 };
                 self.network.send_to_client(command.client_id, response);
+                // Clean up quorum record
+                self.quorum_records.remove(&key);
             }
         }
     }
